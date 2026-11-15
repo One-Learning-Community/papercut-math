@@ -4,16 +4,21 @@ declare(strict_types=1);
 
 namespace Papercut\Math\Render;
 
+use Papercut\Math\Node\DisplayStyle;
+use Papercut\Math\Node\Fallback;
 use Papercut\Math\Node\Fenced;
 use Papercut\Math\Node\Fraction;
 use Papercut\Math\Node\Identifier;
 use Papercut\Math\Node\Node;
 use Papercut\Math\Node\Number;
 use Papercut\Math\Node\Operator;
+use Papercut\Math\Node\Phantom;
 use Papercut\Math\Node\Root;
 use Papercut\Math\Node\Row;
 use Papercut\Math\Node\Scripts;
+use Papercut\Math\Node\Space;
 use Papercut\Math\Node\Text;
+use Papercut\Math\Node\UnderOver;
 use Papercut\Math\OperatorDictionary;
 use Papercut\Math\Styles;
 
@@ -55,8 +60,13 @@ final class TextWriter
             $n instanceof Fraction => self::fraction($n),
             $n instanceof Root => self::root($n),
             $n instanceof Scripts => self::scripts($n),
-            $n instanceof Fenced => $n->open . self::node($n->content) . $n->close,
+            $n instanceof UnderOver => self::underOver($n),
+            $n instanceof Fenced => $n->open . ($n->content instanceof Fraction && ! $n->content->bar ? self::stacked($n->content) : self::node($n->content)) . $n->close,
+            $n instanceof Space => $n->em >= 0.15 ? ' ' : '',
+            $n instanceof Phantom => '',
             $n instanceof Row => self::row($n),
+            $n instanceof DisplayStyle => self::node($n->content),
+            $n instanceof Fallback => $n->content === null ? '' : self::node($n->content),
             default => throw new \InvalidArgumentException('Unknown node ' . $n::class),
         };
     }
@@ -78,15 +88,16 @@ final class TextWriter
         $out = '';
         $prev = null;
         foreach ($r->children as $i => $child) {
-            if ($child instanceof Operator) {
+            $op = Fallback::unwrap($child);
+            if ($op instanceof Operator) {
                 $out .= match (true) {
-                    $forms[$i] === OperatorDictionary::FORM_INFIX && ($child->char === ',' || $child->char === ';') => $child->char . ' ',
-                    $forms[$i] === OperatorDictionary::FORM_INFIX => ' ' . $child->char . ' ',
-                    default => $child->char,
+                    $forms[$i] === OperatorDictionary::FORM_INFIX && ($op->char === ',' || $op->char === ';') => $op->char . ' ',
+                    $forms[$i] === OperatorDictionary::FORM_INFIX => ' ' . $op->char . ' ',
+                    default => $op->char,
                 };
             } else {
-                // A function name set apart from its operand: "sin x", not "sinx".
-                if ($prev instanceof Identifier && mb_strlen($prev->name) > 1) {
+                // A function name set apart from its operand: "sin x", not "sinx"; so is a body after limits.
+                if (($prev instanceof Identifier && mb_strlen($prev->name) > 1) || ($prev !== null && self::endsInLimits($prev))) {
                     $out .= ' ';
                 }
                 $out .= self::node($child);
@@ -101,8 +112,10 @@ final class TextWriter
     private static function atom(Node $n): bool
     {
         return match (true) {
-            $n instanceof Identifier, $n instanceof Number, $n instanceof Fenced, $n instanceof Root, $n instanceof Scripts => true,
+            $n instanceof Identifier, $n instanceof Number, $n instanceof Fenced, $n instanceof Root, $n instanceof Scripts, $n instanceof UnderOver => true,
+            $n instanceof Fraction => ! $n->bar,
             $n instanceof Text => preg_match('/\s/u', $n->text) !== 1,
+            $n instanceof Fallback => $n->content !== null && self::atom($n->content),
             $n instanceof Row => count($n->children) === 1 && self::atom($n->children[0]),
             default => false,
         };
@@ -115,8 +128,17 @@ final class TextWriter
         return self::atom($n) ? $s : '(' . $s . ')';
     }
 
+    private static function stacked(Fraction $f): string
+    {
+        return trim(self::node($f->numerator)) . '; ' . trim(self::node($f->denominator));
+    }
+
     private static function fraction(Fraction $f): string
     {
+        if (! $f->bar) {
+            return '(' . self::stacked($f) . ')';
+        }
+
         return self::wrap($f->numerator) . '/' . self::wrap($f->denominator);
     }
 
@@ -140,6 +162,90 @@ final class TextWriter
         $base = self::node($s->base);
 
         return $base . ($s->sub !== null ? self::script($s->sub, self::SUB, '_') : '') . ($s->sup !== null ? self::script($s->sup, self::SUP, '^') : '');
+    }
+
+    /**
+     * An accent or bar follows its base as a combining mark, a brace is dropped (its label reads as a limit), and other
+     * parts read as limits: `∑_(i=1)^n`.
+     */
+    private static function underOver(UnderOver $u): string
+    {
+        $over = UnderOver::operatorOf($u->over);
+        $under = UnderOver::operatorOf($u->under);
+        $marks = '';
+        $braced = false;
+        $overPlain = $u->over;
+        $underPlain = $u->under;
+        if ($over !== null) {
+            $isBar = in_array($over->char, UnderOver::BARS, true);
+            if ($isBar || ($u->accent && ! UnderOver::isBrace($over, true))) {
+                $marks .= $isBar ? "\u{0304}" : (Styles::accentMark($over->char) ?? $over->char);
+                $overPlain = null;
+            } elseif (UnderOver::isBrace($over, true)) {
+                $braced = true;
+                $overPlain = null;
+            }
+        }
+        if ($under !== null) {
+            $isBar = in_array($under->char, UnderOver::BARS, true);
+            if ($isBar || ($u->accentUnder && ! UnderOver::isBrace($under, false))) {
+                $marks .= $isBar ? "\u{0332}" : (Styles::accentMark($under->char) ?? $under->char);
+                $underPlain = null;
+            } elseif (UnderOver::isBrace($under, false)) {
+                $braced = true;
+                $underPlain = null;
+            }
+        }
+
+        $base = $braced ? self::wrap($u->base) : trim(self::node($u->base));
+        if ($marks !== '') {
+            $base = (mb_strlen($base) === 1 ? $base : '(' . $base . ')') . $marks;
+        }
+        if ($underPlain === null && $overPlain === null) {
+            return $base;
+        }
+        if ($marks === '' && ! $braced && ! self::atom($u->base) && UnderOver::operatorOf($u->base) === null) {
+            $base = '(' . $base . ')';
+        }
+
+        return $base . ($underPlain !== null ? self::limit($underPlain, '_') : '') . ($overPlain !== null ? self::limit($overPlain, '^') : '');
+    }
+
+    /** A limit as `_(i=1)` or `^n`: always the marked form, with the spaces of math dropped. */
+    private static function limit(Node $n, string $mark): string
+    {
+        $s = trim(self::node($n));
+        if (! self::hasText($n)) {
+            $s = str_replace(' ', '', $s);
+        }
+
+        return $mark . (self::atom($n) ? $s : '(' . $s . ')');
+    }
+
+    private static function hasText(Node $n): bool
+    {
+        return $n instanceof Text || array_any($n->children(), self::hasText(...));
+    }
+
+    /** True when the node ends in limits that read as text: a body after it needs a space. */
+    private static function endsInLimits(Node $n): bool
+    {
+        if ($n instanceof Scripts) {
+            $op = UnderOver::operatorOf($n->base);
+
+            return $op !== null && $op->isLargeop(OperatorDictionary::FORM_PREFIX);
+        }
+
+        if (! ($n instanceof UnderOver)) {
+            return false;
+        }
+        $limit = static function (?Node $part, bool $accent): bool {
+            $op = UnderOver::operatorOf($part);
+
+            return $part !== null && ! ($op !== null && ($accent || in_array($op->char, UnderOver::BARS, true) || UnderOver::isBrace($op, true) || UnderOver::isBrace($op, false)));
+        };
+
+        return $limit($n->under, $n->accentUnder) || $limit($n->over, $n->accent);
     }
 
     /** @param array<int|string, string> $map */

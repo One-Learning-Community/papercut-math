@@ -9,7 +9,7 @@ use Papercut\Math\OperatorDictionary;
 /**
  * Operator forms by position. An operator is prefix when it is first in its row or follows another
  * operator or an opening fence; postfix when it is last and follows an operand, or is a closing
- * fence; infix otherwise. A closing fence counts as an operand for what comes after it, so ") - b" is infix.
+ * fence; infix otherwise. An operator whose source fixes its form (mo form=) keeps it. A closing fence counts as an operand for what comes after it, so ") - b" is infix.
  *
  * The bars `|` and `‖` are the same character on both sides, so within a row they pair up: the 1st, 3rd, ...
  * of a kind opens (prefix) and the 2nd, 4th, ... closes (postfix, an operand for what follows). A last bar
@@ -30,15 +30,27 @@ final class Forms
         $prevIsOperand = false;
         $barTotals = [];
         foreach ($children as $child) {
-            if ($child instanceof Operator && self::isBar($child->char)) {
+            $child = Fallback::unwrap($child);
+            if ($child instanceof Operator && $child->form === null && self::isBar($child->char)) {
                 $barTotals[$child->char] = ($barTotals[$child->char] ?? 0) + 1;
             }
         }
         $barSeen = [];
+        // Space-like children (mspace) take no part in inferring forms: they are skipped, as in MathML Core.
+        $last = $count - 1;
+        while ($last > 0 && self::spaceLike($children[$last])) {
+            $last--;
+        }
         foreach ($children as $i => $child) {
+            $child = Fallback::unwrap($child);
             if (! ($child instanceof Operator)) {
                 $forms[] = null;
-                $prevIsOperand = true;
+                $prevIsOperand = $prevIsOperand || ! self::spaceLike($child);
+                continue;
+            }
+            if ($child->form !== null) {
+                $forms[] = $child->form;
+                $prevIsOperand = $child->form === OperatorDictionary::FORM_POSTFIX;
                 continue;
             }
             if (self::isBar($child->char)) {
@@ -58,13 +70,21 @@ final class Forms
             $forms[] = match (true) {
                 OperatorDictionary::isClosing($child->char) => OperatorDictionary::FORM_POSTFIX,
                 ! $prevIsOperand => OperatorDictionary::FORM_PREFIX,
-                $i === $count - 1 => OperatorDictionary::FORM_POSTFIX,
+                $i >= $last => OperatorDictionary::FORM_POSTFIX,
                 default => OperatorDictionary::FORM_INFIX,
             };
             $prevIsOperand = OperatorDictionary::isClosing($child->char);
         }
 
         return $forms;
+    }
+
+    /** A Space, or a Phantom of space-like content: occupies room but is no operand. */
+    public static function spaceLike(Node $n): bool
+    {
+        $n = Fallback::unwrap($n);
+
+        return $n instanceof Space || ($n instanceof Phantom && self::spaceLike($n->content));
     }
 
     private static function isBar(string $char): bool

@@ -26,6 +26,7 @@
     "require": {
         "php": "^8.4",
         "ext-ctype": "*",
+        "ext-dom": "*",
         "ext-mbstring": "*"
     },
     "require-dev": {
@@ -53,7 +54,7 @@
     },
     "extra": {
         "branch-alias": {
-            "dev-main": "0.12.x-dev"
+            "dev-main": "0.13.x-dev"
         }
     }
 }

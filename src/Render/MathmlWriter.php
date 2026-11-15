@@ -4,16 +4,21 @@ declare(strict_types=1);
 
 namespace Papercut\Math\Render;
 
+use Papercut\Math\Node\DisplayStyle;
+use Papercut\Math\Node\Fallback;
 use Papercut\Math\Node\Fenced;
 use Papercut\Math\Node\Fraction;
 use Papercut\Math\Node\Identifier;
 use Papercut\Math\Node\Node;
 use Papercut\Math\Node\Number;
 use Papercut\Math\Node\Operator;
+use Papercut\Math\Node\Phantom;
 use Papercut\Math\Node\Root;
 use Papercut\Math\Node\Row;
 use Papercut\Math\Node\Scripts;
+use Papercut\Math\Node\Space;
 use Papercut\Math\Node\Text;
+use Papercut\Math\Node\UnderOver;
 use Papercut\Math\OperatorDictionary;
 use Papercut\Math\Styles;
 
@@ -29,20 +34,39 @@ final class MathmlWriter
     private static function node(Node $n): string
     {
         return match (true) {
-            $n instanceof Identifier => '<mi' . ($n->upright ? ' mathvariant="normal"' : '') . '>' . Xml::text(self::plain($n->name)) . '</mi>',
+            $n instanceof Identifier => '<mi' . ($n->upright ? ' mathvariant="normal"' : '') . '>' . Xml::text($n->upright ? $n->name : self::plain($n->name)) . '</mi>',
             $n instanceof Number => '<mn>' . Xml::text($n->text) . '</mn>',
             // Alone, the layout treats an operator as prefix while a browser infers infix.
             $n instanceof Operator => self::operator($n, OperatorDictionary::FORM_PREFIX, OperatorDictionary::FORM_INFIX),
             $n instanceof Text => '<mtext>' . Xml::text(self::keepSpaces($n->text)) . '</mtext>',
-            $n instanceof Fraction => '<mfrac>' . self::node($n->numerator) . self::node($n->denominator) . '</mfrac>',
+            $n instanceof Fraction => '<mfrac' . ($n->bar ? '' : ' linethickness="0"') . '>' . self::slot($n->numerator) . self::slot($n->denominator) . '</mfrac>',
+            $n instanceof Space => '<mspace width="' . self::em($n->em) . 'em"/>',
+            $n instanceof Phantom => '<mphantom>' . self::node($n->content) . '</mphantom>',
             $n instanceof Root => $n->index === null
-                ? '<msqrt>' . self::node($n->radicand) . '</msqrt>'
-                : '<mroot>' . self::node($n->radicand) . self::node($n->index) . '</mroot>',
+                ? '<msqrt>' . self::slot($n->radicand) . '</msqrt>'
+                : '<mroot>' . self::slot($n->radicand) . self::slot($n->index) . '</mroot>',
             $n instanceof Scripts => self::scripts($n),
+            $n instanceof UnderOver => self::underOver($n),
             $n instanceof Fenced => self::fenced($n),
             $n instanceof Row => self::row($n),
+            $n instanceof DisplayStyle => '<mstyle displaystyle="' . ($n->display ? 'true' : 'false') . '">' . self::node($n->content) . '</mstyle>',
+            $n instanceof Fallback => $n->content === null ? '' : self::node($n->content),
             default => throw new \InvalidArgumentException('Unknown node ' . $n::class),
         };
+    }
+
+    /** A child in a fixed-arity element: a dropped one is written as an empty mrow so the others keep their places. */
+    private static function slot(Node $n): string
+    {
+        return $n instanceof Fallback && $n->content === null ? '<mrow></mrow>' : self::node($n);
+    }
+
+    /** An em width with up to 3 decimals and no trailing zeros. */
+    private static function em(float $em): string
+    {
+        $s = rtrim(rtrim(number_format($em, 3, '.', ''), '0'), '.');
+
+        return $s === '-0' || $s === '' ? '0' : $s;
     }
 
     /** Browsers collapse and trim spaces in mtext; no-break spaces survive. A single inner space stays a plain space. */
@@ -66,15 +90,25 @@ final class MathmlWriter
     /**
      * @param string $form the form the layout used
      * @param string $inferred the form a browser infers from the position
+     * @param bool $stretched the layout stretches this operator (part of a stack), so it is not told to stay put
      */
-    private static function operator(Operator $o, string $form, string $inferred, bool $fence = false): string
+    private static function operator(Operator $o, string $form, string $inferred, bool $fence = false, bool $stretched = false): string
     {
+        $form = $o->form ?? $form;
         $attrs = $form !== $inferred ? ' form="' . $form . '"' : '';
         if ($fence) {
             $attrs .= ' stretchy="true"';
-        } elseif (OperatorDictionary::lookup($o->char, $form)['stretchy']) {
+        } elseif ($o->stretchy !== null) {
+            $attrs .= ' stretchy="' . ($o->stretchy ? 'true' : 'false') . '"';
+        } elseif (! $stretched && OperatorDictionary::lookup($o->char, $form)['stretchy']) {
             // Only Fenced delimiters stretch in the PDF, so keep the browser from stretching the others.
             $attrs .= ' stretchy="false"';
+        }
+        if ($o->largeop !== null) {
+            $attrs .= ' largeop="' . ($o->largeop ? 'true' : 'false') . '"';
+        }
+        if ($o->movablelimits !== null) {
+            $attrs .= ' movablelimits="' . ($o->movablelimits ? 'true' : 'false') . '"';
         }
 
         return '<mo' . $attrs . '>' . Xml::text($o->char) . '</mo>';
@@ -92,23 +126,68 @@ final class MathmlWriter
             $resolved = $forms[$i];
             // What a browser infers from the position in the mrow: first prefix, last postfix, else infix.
             $inferred = $i === 0 ? OperatorDictionary::FORM_PREFIX : ($i === $count - 1 ? OperatorDictionary::FORM_POSTFIX : OperatorDictionary::FORM_INFIX);
-            $out .= $child instanceof Operator ? self::operator($child, $resolved ?? $inferred, $inferred) : self::node($child);
+            $op = Fallback::unwrap($child);
+            $out .= $op instanceof Operator ? self::styled($child, self::operator($op, $resolved ?? $inferred, $inferred)) : self::node($child);
         }
 
         return '<mrow>' . $out . '</mrow>';
     }
 
-    private static function scripts(Scripts $s): string
+    /** An operator's markup inside the mstyle displaystyle wrappers its node was peeled out of. */
+    private static function styled(Node $node, string $xml): string
     {
-        $base = self::node($s->base);
-        if ($s->sub !== null && $s->sup !== null) {
-            return '<msubsup>' . $base . self::node($s->sub) . self::node($s->sup) . '</msubsup>';
+        $displays = Fallback::displays($node);
+        $inner = Fallback::unwrap($node);
+        if ($inner instanceof Row && count($inner->children) === 1) {
+            $displays = [...$displays, ...Fallback::displays($inner->children[0])];
         }
-        if ($s->sup !== null) {
-            return '<msup>' . $base . self::node($s->sup) . '</msup>';
+        foreach (array_reverse($displays) as $display) {
+            $xml = '<mstyle displaystyle="' . ($display ? 'true' : 'false') . '">' . $xml . '</mstyle>';
         }
 
-        return '<msub>' . $base . self::node($s->sub ?? throw new \LogicException('Scripts without a script')) . '</msub>';
+        return $xml;
+    }
+
+    private static function scripts(Scripts $s): string
+    {
+        $base = self::slot($s->base);
+        if ($s->sub !== null && $s->sup !== null) {
+            return '<msubsup>' . $base . self::slot($s->sub) . self::slot($s->sup) . '</msubsup>';
+        }
+        if ($s->sup !== null) {
+            return '<msup>' . $base . self::slot($s->sup) . '</msup>';
+        }
+
+        return '<msub>' . $base . self::slot($s->sub ?? throw new \LogicException('Scripts without a script')) . '</msub>';
+    }
+
+    private static function underOver(UnderOver $u): string
+    {
+        $part = static function (Node $n): string {
+            $op = UnderOver::operatorOf($n);
+
+            return $op !== null ? self::styled($n, self::operator($op, OperatorDictionary::FORM_INFIX, OperatorDictionary::FORM_INFIX, false, true)) : self::slot($n);
+        };
+        $baseOp = UnderOver::operatorOf($u->base);
+        if (UnderOver::isLimitName($u->base)) {
+            // Marked as an operator so a browser sets its limit beside it in inline style, as the PDF does.
+            $name = UnderOver::nameNode($u->base);
+            $base = '<mo movablelimits="true">' . Xml::text($name instanceof Identifier ? $name->name : ($name instanceof Operator ? $name->char : '')) . '</mo>';
+        } elseif ($baseOp !== null) {
+            $stretches = $baseOp->stretchy ?? OperatorDictionary::lookup($baseOp->char, OperatorDictionary::FORM_POSTFIX)['stretchy'];
+            $form = $baseOp->isLargeop(OperatorDictionary::FORM_PREFIX) ? OperatorDictionary::FORM_PREFIX : OperatorDictionary::FORM_INFIX;
+            $base = self::styled($u->base, self::operator($baseOp, $form, OperatorDictionary::FORM_INFIX, false, $stretches));
+        } else {
+            $base = self::slot($u->base);
+        }
+        if ($u->under !== null && $u->over !== null) {
+            return '<munderover' . ($u->accent ? ' accent="true"' : '') . ($u->accentUnder ? ' accentunder="true"' : '') . '>' . $base . $part($u->under) . $part($u->over) . '</munderover>';
+        }
+        if ($u->over !== null) {
+            return '<mover' . ($u->accent ? ' accent="true"' : '') . '>' . $base . $part($u->over) . '</mover>';
+        }
+
+        return '<munder' . ($u->accentUnder ? ' accentunder="true"' : '') . '>' . $base . $part($u->under ?? throw new \LogicException('UnderOver without a part')) . '</munder>';
     }
 
     private static function fenced(Fenced $f): string
