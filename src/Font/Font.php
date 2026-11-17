@@ -7,10 +7,10 @@ namespace Quoin\Math\Font;
 use Quoin\Math\Exception\UnsupportedFont;
 
 /**
- * Minimal TrueType (glyf) reader: metrics, cmap (formats 4 and 12), outlines including composites,
- * and the OpenType MATH table. CFF outlines are not supported.
+ * Minimal OpenType math font reader with TrueType (glyf) or CFF outlines: metrics, cmap (formats 4
+ * and 12), glyph outlines, and the MATH table.
  */
-final class TrueTypeFont
+final class Font
 {
     private Binary $b;
 
@@ -37,6 +37,7 @@ final class TrueTypeFont
     private array $gidCache = [];
     /** @var array<int, bool> straightness by gid * 2 + (vertical ? 1 : 0) */
     private array $straightCache = [];
+    private ?CffOutlines $cff = null;
     private ?MathTable $math = null;
     private ?Gsub $gsub = null;
 
@@ -44,37 +45,47 @@ final class TrueTypeFont
     {
         $this->b = new Binary($data);
         $tag = substr($data, 0, 4);
-        if ($tag === 'OTTO') {
-            throw UnsupportedFont::cff($path);
-        }
         if ($tag === 'ttcf') {
             throw new UnsupportedFont($path, "$path is a font collection; pass a single font file");
         }
         $n = strlen($data) >= 12 ? $this->b->u16(4) : 0;
-        if ($n === 0 || 12 + 16 * $n > strlen($data)) {
+        if (! in_array($tag, ["\0\x01\0\0", 'true', 'OTTO'], true) || $n === 0 || 12 + 16 * $n > strlen($data)) {
             throw new UnsupportedFont($path, "$path is not a TrueType/OpenType font");
         }
         for ($i = 0; $i < $n; $i++) {
             $o = 12 + $i * 16;
-            $this->tables[substr($data, $o, 4)] = [$this->b->u32($o + 8), $this->b->u32($o + 12)];
+            $tag4 = substr($data, $o, 4);
+            [$at, $length] = [$this->b->u32($o + 8), $this->b->u32($o + 12)];
+            if ($at + $length > strlen($data)) {
+                throw new UnsupportedFont($path, "$path has a $tag4 table that lies outside the file; the file is cut short or damaged");
+            }
+            $this->tables[$tag4] = [$at, $length];
         }
-        if (isset($this->tables['CFF ']) || isset($this->tables['CFF2'])) {
+        if (isset($this->tables['CFF2'])) {
             throw UnsupportedFont::cff($path);
         }
         if (! isset($this->tables['MATH'])) {
             throw UnsupportedFont::noMathTable($path);
         }
-        foreach (['head', 'hhea', 'maxp', 'hmtx', 'cmap', 'loca', 'glyf'] as $t) {
+        $outlines = isset($this->tables['CFF ']) ? ['CFF '] : ['loca', 'glyf'];
+        foreach (['head', 'hhea', 'maxp', 'hmtx', 'cmap', ...$outlines] as $t) {
             if (! isset($this->tables[$t])) {
-                throw new \RuntimeException("Font has no $t table");
+                throw new UnsupportedFont($path, "$path has no $t table, so it is not a usable font");
             }
         }
         $head = $this->tables['head'][0];
         $this->unitsPerEm = $this->b->u16($head + 18);
         $this->locaFormat = $this->b->i16($head + 50);
+        if (isset($this->tables['CFF '])) {
+            try {
+                $this->cff = new CffOutlines($this->b, $this->tables['CFF '][0], $this->tables['CFF '][1], $this->unitsPerEm, $this->b->u16($this->tables['maxp'][0] + 4));
+            } catch (\UnexpectedValueException $e) {
+                throw new UnsupportedFont($path, "$path cannot be read: {$e->getMessage()}");
+            }
+        }
         $this->numGlyphs = $this->b->u16($this->tables['maxp'][0] + 4);
         $this->numHMetrics = $this->b->u16($this->tables['hhea'][0] + 34);
-        $this->readCmap();
+        $this->readCmap($path);
     }
 
     /** Fonts opened by fromFile(), by real path, so a font checked once (a config check, then the render) is parsed once. */
@@ -86,7 +97,7 @@ final class TrueTypeFont
     /**
      * Opens a font file. The same unchanged file gives the same instance within a process (the newest few are kept).
      *
-     * @throws UnsupportedFont for a CFF font, a collection, a font without a MATH table, or a file that is no font
+     * @throws UnsupportedFont for a CFF2 or CID-keyed font, a collection, a font without a MATH table, or a file that is no usable font
      */
     public static function fromFile(string $path): self
     {
@@ -149,7 +160,7 @@ final class TrueTypeFont
         return $this->b->u16($hm + $i * 4);
     }
 
-    private function readCmap(): void
+    private function readCmap(string $path): void
     {
         $c = $this->tables['cmap'][0];
         $n = $this->b->u16($c + 2);
@@ -172,7 +183,7 @@ final class TrueTypeFont
             }
         }
         if ($best === null) {
-            throw new \RuntimeException('No usable cmap (need format 4 or 12)');
+            throw new UnsupportedFont($path, "$path has no usable cmap (need format 4 or 12)");
         }
         [$fmt, $o] = $best;
         if ($fmt === 12) {
@@ -295,6 +306,9 @@ final class TrueTypeFont
         if (isset($this->bboxCache[$gid])) {
             return $this->bboxCache[$gid];
         }
+        if ($this->cff !== null) {
+            return $this->bboxCache[$gid] = $this->cff->bbox($gid);
+        }
         [$o, $len] = $this->glyphRange($gid);
         if ($len <= 0) {
             return $this->bboxCache[$gid] = [0, 0, 0, 0];
@@ -306,7 +320,9 @@ final class TrueTypeFont
     }
 
     /**
-     * Outline as contours of [x, y, onCurve] points (quadratic TrueType semantics), font units, y up.
+     * Outline as contours of [x, y, onCurve] points (quadratic TrueType semantics), font units, y up. A CFF font's
+     * cubic curves are approximated by two quadratics each, which is enough for the readers that look at extremes;
+     * drawing uses outlinePath().
      *
      * @return list<list<array{float,float,bool}>>
      *
@@ -316,6 +332,9 @@ final class TrueTypeFont
     {
         if (isset($this->contourCache[$gid])) {
             return $this->contourCache[$gid];
+        }
+        if ($this->cff !== null) {
+            return $this->contourCache[$gid] = $this->cff->contours($gid);
         }
         [$o, $len] = $this->glyphRange($gid);
         if ($len <= 0 || $depth > 6) {
@@ -372,9 +391,10 @@ final class TrueTypeFont
     }
 
     /**
-     * The glyph outline as path data: M, L, Q and Z commands only, all absolute, in font units with y up (divide by
+     * The glyph outline as path data: M, L, Q, C and Z commands only, all absolute, in font units with y up (divide by
      * `unitsPerEm` for em). Built once per glyph. Empty for a glyph with no outline, such as a space.
      * Scale and place it with a transform: x' = x * scale + left, y' = baseline - y * scale.
+     * A TrueType font gives quadratic curves (Q) and a CFF font gives cubic curves (C); neither gives the other.
      */
     public function outlinePath(int $gid): string
     {
@@ -382,6 +402,13 @@ final class TrueTypeFont
             return $this->pathCache[$gid];
         }
         $d = '';
+        if ($this->cff !== null) {
+            foreach ($this->cff->path($gid) as [$op, $v]) {
+                $d .= $op . implode(' ', array_map(self::unit(...), $v));
+            }
+
+            return $this->pathCache[$gid] = $d;
+        }
         foreach ($this->contours($gid) as $pts) {
             if (count($pts) < 2) {
                 continue;
