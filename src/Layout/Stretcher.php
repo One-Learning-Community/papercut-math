@@ -52,11 +52,11 @@ final class Stretcher
     }
 
     /**
-     * A size variant (or assembly) of $gid at least $targetUnits tall, centred on the math axis, with $lead before it and
+     * A size variant (or assembly) of $gid at least $targetUnits tall, centered on the math axis, with $lead before it and
      * $trail after it (both pt). $char is the text a backend sets for a single glyph; $italic gives the box the glyph's
      * italics correction.
      */
-    public static function axisCentred(Context $c, string $char, int $gid, float $targetUnits, float $lead, float $trail, bool $italic = false): Box
+    public static function axisCentered(Context $c, string $char, int $gid, float $targetUnits, float $lead, float $trail, bool $italic = false): Box
     {
         $u = $c->unit();
         $m = $c->font->math();
