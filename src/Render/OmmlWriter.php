@@ -19,6 +19,7 @@ use Quoin\Math\Node\Root;
 use Quoin\Math\Node\Row;
 use Quoin\Math\Node\Scripts;
 use Quoin\Math\Node\Space;
+use Quoin\Math\Node\TexSource;
 use Quoin\Math\Node\Text;
 use Quoin\Math\Node\UnderOver;
 use Quoin\Math\OperatorDictionary;
@@ -92,7 +93,7 @@ final class OmmlWriter
             $n instanceof Fenced => self::fenced($n, $rPr),
             $n instanceof Grid => self::grid($n, $rPr),
             $n instanceof Row => self::sequence($n->children, $rPr),
-            $n instanceof DisplayStyle => self::node($n->content, $rPr),
+            $n instanceof DisplayStyle, $n instanceof TexSource => self::node($n->content, $rPr),
             $n instanceof Fallback => $n->content === null ? '' : self::node($n->content, $rPr),
             default => throw new \InvalidArgumentException('Unknown node ' . $n::class),
         };
@@ -252,17 +253,25 @@ final class OmmlWriter
         if ($nary !== null) {
             return self::naryXml($nary, null, $rPr);
         }
-        $e = '<m:e>' . self::node($s->base, $rPr) . '</m:e>';
-        $sub = $s->sub === null ? '' : '<m:sub>' . self::node($s->sub, $rPr) . '</m:sub>';
-        $sup = $s->sup === null ? '' : '<m:sup>' . self::node($s->sup, $rPr) . '</m:sup>';
-        $tag = match (true) {
-            $s->sub !== null && $s->sup !== null => 'm:sSubSup',
-            $s->sup !== null => 'm:sSup',
-            $s->sub !== null => 'm:sSub',
-            default => throw new \LogicException('Scripts without a script'),
-        };
+        $e = self::node($s->base, $rPr);
+        if ($s->sub !== null || $s->sup !== null) {
+            $tag = match (true) {
+                $s->sub !== null && $s->sup !== null => 'm:sSubSup',
+                $s->sup !== null => 'm:sSup',
+                default => 'm:sSub',
+            };
+            $e = '<' . $tag . '><m:e>' . $e . '</m:e>'
+                . ($s->sub === null ? '' : '<m:sub>' . self::node($s->sub, $rPr) . '</m:sub>')
+                . ($s->sup === null ? '' : '<m:sup>' . self::node($s->sup, $rPr) . '</m:sup>')
+                . '</' . $tag . '>';
+        }
+        if ($s->preSub === null && $s->preSup === null) {
+            return $e;
+        }
 
-        return '<' . $tag . '>' . $e . $sub . $sup . '</' . $tag . '>';
+        // Word's pre-script element needs both slots; a missing one is empty.
+        return '<m:sPre><m:sub>' . ($s->preSub === null ? '' : self::node($s->preSub, $rPr)) . '</m:sub><m:sup>'
+            . ($s->preSup === null ? '' : self::node($s->preSup, $rPr)) . '</m:sup><m:e>' . $e . '</m:e></m:sPre>';
     }
 
     /**
@@ -318,6 +327,9 @@ final class OmmlWriter
         if (! ($n instanceof UnderOver || $n instanceof Scripts)) {
             return null;
         }
+        if ($n instanceof Scripts && ($n->preSub !== null || $n->preSup !== null)) {
+            return null;
+        }
         $op = UnderOver::operatorOf($n->base);
         if ($op === null || ! self::single($op->char) || ! $op->isLargeop(OperatorDictionary::FORM_PREFIX)) {
             return null;
@@ -348,25 +360,36 @@ final class OmmlWriter
         }
         $arrow = UnderOver::operatorOf($u->base);
         if ($arrow !== null && $u->base === $arrow && UnderOver::isStretchy($arrow) && UnderOver::isArrow($arrow->char) && ($u->over !== null || $u->under !== null) && self::single($arrow->char)) {
-            return self::labeledArrow($u, $arrow->char, $rPr);
+            // A label that draws nothing (the empty one a label-less chemistry arrow carries) is no label.
+            $over = UnderOver::blank($u->over) ? null : $u->over;
+            $under = UnderOver::blank($u->under) ? null : $u->under;
+            if ($over === null && $under === null) {
+                // KaTeX draws the long arrows for these.
+                return self::node(new Operator(UnderOver::LONG_ARROWS[$arrow->char] ?? $arrow->char), $rPr);
+            }
+
+            return self::labeledArrow($over, $under, $arrow->char, $rPr);
         }
         $out = self::node($u->base, $rPr);
-        if ($u->under !== null) {
-            $op = UnderOver::operatorOf($u->under);
+        // A part that draws nothing is no limit: it would write an empty <m:lim>.
+        $underPart = UnderOver::blank($u->under) ? null : $u->under;
+        $overPart = UnderOver::blank($u->over) ? null : $u->over;
+        if ($underPart !== null) {
+            $op = UnderOver::operatorOf($underPart);
             $out = match (true) {
                 $op !== null && in_array($op->char, UnderOver::BARS, true) => self::bar($out, 'bot'),
                 $op !== null && UnderOver::isBrace($op, false) => self::groupChr($out, $op->char, 'bot', 'top', $rPr),
                 $op !== null && $u->accentUnder => self::groupChr($out, Styles::accentMark($op->char) ?? $op->char, 'bot', 'top', $rPr),
-                default => '<m:limLow><m:e>' . $out . '</m:e><m:lim>' . self::node($u->under, $rPr) . '</m:lim></m:limLow>',
+                default => '<m:limLow><m:e>' . $out . '</m:e><m:lim>' . self::node($underPart, $rPr) . '</m:lim></m:limLow>',
             };
         }
-        if ($u->over !== null) {
-            $op = UnderOver::operatorOf($u->over);
+        if ($overPart !== null) {
+            $op = UnderOver::operatorOf($overPart);
             $out = match (true) {
                 $op !== null && in_array($op->char, UnderOver::BARS, true) => self::bar($out, 'top'),
-                $op !== null && $u->accent => self::accent($out, Styles::accentMark($op->char) ?? $op->char, $rPr, $u->over),
+                $op !== null && $u->accent => self::accent($out, Styles::accentMark($op->char) ?? $op->char, $rPr, $overPart),
                 $op !== null && UnderOver::isBrace($op, true) => self::groupChr($out, $op->char, 'top', 'bot', $rPr),
-                default => '<m:limUpp><m:e>' . $out . '</m:e><m:lim>' . self::node($u->over, $rPr) . '</m:lim></m:limUpp>',
+                default => '<m:limUpp><m:e>' . $out . '</m:e><m:lim>' . self::node($overPart, $rPr) . '</m:lim></m:limUpp>',
             };
         }
 
@@ -378,12 +401,14 @@ final class OmmlWriter
      * content on the baseline at full size, so the arrow is grouped over an invisible copy of the wider label
      * (zero height, width kept) and the real labels, at script size, are limits around it.
      */
-    private static function labeledArrow(UnderOver $u, string $char, string $rPr): string
+    private static function labeledArrow(?Node $overNode, ?Node $underNode, string $char, string $rPr): string
     {
-        $over = $u->over === null ? null : self::node($u->over, $rPr);
-        $under = $u->under === null ? null : self::node($u->under, $rPr);
+        $over = $overNode === null ? null : self::node($overNode, $rPr);
+        $under = $underNode === null ? null : self::node($underNode, $rPr);
         $wide = $under === null || ($over !== null && self::textLength($over) >= self::textLength($under)) ? $over : $under;
-        $out = self::groupChr('<m:phant><m:phantPr><m:show m:val="0"/><m:zeroAsc m:val="1"/><m:zeroDesc m:val="1"/></m:phantPr><m:e>' . $wide . '</m:e></m:phant>', $char, 'top', 'bot', $rPr);
+        // An en space on each side of the hidden label: the arrow reaches past its label, and a short label still gets a long arrow.
+        $pad = self::run("\u{2002}", $rPr);
+        $out = self::groupChr('<m:phant><m:phantPr><m:show m:val="0"/><m:zeroAsc m:val="1"/><m:zeroDesc m:val="1"/></m:phantPr><m:e>' . $pad . $wide . $pad . '</m:e></m:phant>', $char, 'top', 'bot', $rPr);
         if ($over !== null) {
             $out = '<m:limUpp><m:e>' . $out . '</m:e><m:lim>' . $over . '</m:lim></m:limUpp>';
         }

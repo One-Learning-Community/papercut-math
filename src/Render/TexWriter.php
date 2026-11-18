@@ -20,6 +20,7 @@ use Quoin\Math\Node\Root;
 use Quoin\Math\Node\Row;
 use Quoin\Math\Node\Scripts;
 use Quoin\Math\Node\Space;
+use Quoin\Math\Node\TexSource;
 use Quoin\Math\Node\Text;
 use Quoin\Math\Node\UnderOver;
 use Quoin\Math\OperatorDictionary;
@@ -48,9 +49,34 @@ final class TexWriter
     /** Ordinary symbols that are safe unbraced as a script argument. */
     private const array BARE_SCRIPT_SYMBOLS = ['infty', 'partial', 'nabla', 'hbar', 'ell', 'emptyset', 'prime', 'aleph'];
 
+    /** @var array<int, true> ids of the TexSource nodes that may be written as an equation number: those at the top of the formula */
+    private static array $topLevel = [];
+
     public static function write(Node $root): string
     {
-        return self::trimTex(self::w($root, false));
+        $saved = self::$topLevel;
+        self::$topLevel = [];
+        $top = self::strip($root);
+        while ($top instanceof DisplayStyle) {
+            // `\displaystyle x \tag{1}` reads as a switch around the whole formula: its tag is still at the top.
+            $top = self::strip($top->content);
+        }
+        $tagged = false;
+        foreach ($top instanceof Row ? $top->children : [$top] as $child) {
+            if ($child instanceof TexSource && str_starts_with($child->tex, '\\tag')) {
+                // KaTeX rejects a second equation number.
+                if ($tagged) {
+                    continue;
+                }
+                $tagged = true;
+            }
+            self::$topLevel[spl_object_id($child)] = true;
+        }
+        try {
+            return self::trimTex(self::w($root, false));
+        } finally {
+            self::$topLevel = $saved;
+        }
     }
 
     /** trim(), except that a control space `\ ` at the very end keeps its space. */
@@ -68,6 +94,7 @@ final class TexWriter
     {
         return match (true) {
             $n instanceof Fallback => $n->content === null ? '' : self::w($n->content, $inFence),
+            $n instanceof TexSource => self::source($n, $inFence),
             $n instanceof Row => self::row($n, $inFence),
             $n instanceof Identifier => self::identifier($n),
             // A MathML-only number such as '1,000' is written raw: the nearest TeX.
@@ -98,6 +125,7 @@ final class TexWriter
         }
         $pieces = [];
         $afterNumber = false;
+        $previous = null;
         foreach ($row->children as $kid) {
             $bare = self::strip($kid);
             if ($bare instanceof Row) {
@@ -108,6 +136,11 @@ final class TexWriter
             if ($piece === '') {
                 continue;
             }
+            if ($bare instanceof Scripts && ($bare->preSub !== null || $bare->preSup !== null) && $previous instanceof Scripts) {
+                // After scripts, a bare `{}_a X` would read as more scripts of the node before; a group of its own keeps them prescripts.
+                $piece = '{' . $piece . '}';
+            }
+            $previous = $bare;
             // Numbers side by side would read as one number, so each after the first is braced.
             $isNumber = $bare instanceof Number;
             $pieces[] = $isNumber && $afterNumber ? '{' . $piece . '}' : $piece;
@@ -140,6 +173,21 @@ final class TexWriter
         }
 
         return null;
+    }
+
+    private static function source(TexSource $s, bool $inFence): string
+    {
+        if ($s->close === null) {
+            return $s->tex;
+        }
+        if (str_starts_with($s->tex, '\\tag')) {
+            // KaTeX accepts an equation number only at the top of a formula.
+            return isset(self::$topLevel[spl_object_id($s)]) ? $s->tex : '';
+        }
+        $inner = self::strip($s->content);
+        $body = str_starts_with($s->tex, '\\fbox') && $inner instanceof Text ? self::textEscape($inner->text) : self::w($s->content, false);
+
+        return $s->tex . $body . $s->close;
     }
 
     /** The node with Fallback wrappers peeled. */
@@ -531,6 +579,14 @@ final class TexWriter
 
     private static function scripts(Scripts $s): string
     {
+        if ($s->preSub !== null || $s->preSup !== null) {
+            // The empty group gives the prescripts something to attach to; the base then takes its own scripts as usual.
+            $pre = '{}' . self::scriptParts($s->preSub, $s->preSup);
+            $post = $s->sub === null && $s->sup === null ? self::base($s->base) : self::scripts(new Scripts($s->base, $s->sub, $s->sup));
+
+            // A control word ends at a space, not at the letter of the base after it.
+            return $pre . (preg_match('/\\\\[a-zA-Z]+$/', $pre) === 1 ? ' ' : '') . $post;
+        }
         $op = UnderOver::operatorOf($s->base);
         $nolimits = UnderOver::isLimitName($s->base) || ($op !== null && $op->isLargeop(OperatorDictionary::FORM_PREFIX) && $op->hasMovableLimits(OperatorDictionary::FORM_PREFIX));
         // `{\displaystyle \lim}\nolimits_i` is no TeX: the group stands for the operator, so its scripts simply follow it.

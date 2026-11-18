@@ -22,6 +22,7 @@ use Quoin\Math\Node\Root;
 use Quoin\Math\Node\Row;
 use Quoin\Math\Node\Scripts;
 use Quoin\Math\Node\Space;
+use Quoin\Math\Node\TexSource;
 use Quoin\Math\Node\Text;
 use Quoin\Math\Node\UnderOver;
 use Quoin\Math\Tex\TexReader;
@@ -174,6 +175,14 @@ final class Math
     public static function subSup(string|Node $base, string|Node $sub, string|Node $sup): Scripts
     {
         return new Scripts(self::row($base), self::row($sub), self::row($sup));
+    }
+
+    /** A base with scripts on its left and, optionally, on its right (mmultiscripts): `{}^{14}_{6}\mathrm{C}`. */
+    public static function prescripts(string|Node $base, string|Node|null $preSub, string|Node|null $preSup, string|Node|null $sub = null, string|Node|null $sup = null): Scripts
+    {
+        $row = static fn (string|Node|null $n): ?Node => $n === null ? null : self::row($n);
+
+        return new Scripts(self::row($base), $row($sub), $row($sup), $row($preSub), $row($preSup));
     }
 
     /** A part below the base (munder). */
@@ -394,6 +403,9 @@ final class Math
         }
         if ($cell instanceof DisplayStyle) {
             return new DisplayStyle(self::infixLead($cell->content), $cell->display);
+        }
+        if ($cell instanceof TexSource) {
+            return new TexSource(self::infixLead($cell->content), $cell->tex, $cell->close);
         }
         if ($cell instanceof Operator) {
             return new Operator(

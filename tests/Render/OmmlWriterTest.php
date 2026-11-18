@@ -52,6 +52,22 @@ final class OmmlWriterTest extends TestCase
         self::assertSame('oMathPara', $doc->documentElement?->firstElementChild?->localName);
     }
 
+    public function test_label_less_arrow_is_a_plain_long_arrow(): void
+    {
+        $xml = OmmlWriter::oMath(Math::tex('\\ce{A -> B}'));
+        self::assertStringNotContainsString('<m:lim></m:lim>', $xml);
+        self::assertStringNotContainsString('<m:phant>', $xml);
+        self::assertStringContainsString('⟶', $xml);
+        self::assertStringContainsString('⇌', OmmlWriter::oMath(Math::tex('\\ce{A <=> B}')));
+    }
+
+    public function test_one_label_has_no_empty_limit(): void
+    {
+        $xml = OmmlWriter::oMath(Math::tex('\\ce{A ->[x] B}'));
+        self::assertStringNotContainsString('<m:limLow>', $xml);
+        self::assertStringNotContainsString('<m:lim></m:lim>', $xml);
+    }
+
     public function test_square_root_hides_degree(): void
     {
         $xml = OmmlWriter::oMath(Math::sqrt('x'));
@@ -380,22 +396,24 @@ final class OmmlWriterTest extends TestCase
         self::assertStringContainsString('abc', OmmlWriter::oMath(Math::accent('x', 'abc')));
     }
 
-    public function test_labeled_arrow_is_a_group_character_over_a_phantom_of_the_wider_label(): void
+    public function test_labeled_arrow_is_a_group_character_over_a_padded_phantom_of_the_wider_label(): void
     {
         $ph = '<m:phant><m:phantPr><m:show m:val="0"/><m:zeroAsc m:val="1"/><m:zeroDesc m:val="1"/></m:phantPr><m:e>';
+        // An en space on each side of the hidden label, so a short label still gets a long arrow.
+        $pad = self::mr("\u{2002}");
         $arrow = '<m:groupChr><m:groupChrPr><m:chr m:val="→"/><m:pos m:val="top"/><m:vertJc m:val="bot"/></m:groupChrPr><m:e>';
 
         $over = self::oMath(Math::xarrow('→', 'f'));
-        self::assertSame('<m:oMath><m:limUpp><m:e>' . $arrow . $ph . self::mr('f') . '</m:e></m:phant></m:e></m:groupChr></m:e><m:lim>' . self::mr('f') . '</m:lim></m:limUpp></m:oMath>', $over);
+        self::assertSame('<m:oMath><m:limUpp><m:e>' . $arrow . $ph . $pad . self::mr('f') . $pad . '</m:e></m:phant></m:e></m:groupChr></m:e><m:lim>' . self::mr('f') . '</m:lim></m:limUpp></m:oMath>', $over);
 
         $under = self::oMath(Math::xarrow('→', null, 'g'));
-        self::assertSame('<m:oMath><m:limLow><m:e>' . $arrow . $ph . self::mr('g') . '</m:e></m:phant></m:e></m:groupChr></m:e><m:lim>' . self::mr('g') . '</m:lim></m:limLow></m:oMath>', $under);
+        self::assertSame('<m:oMath><m:limLow><m:e>' . $arrow . $ph . $pad . self::mr('g') . $pad . '</m:e></m:phant></m:e></m:groupChr></m:e><m:lim>' . self::mr('g') . '</m:lim></m:limLow></m:oMath>', $under);
 
         // Both labels: the phantom copies the wider one; the real labels are the limits.
         $both = self::oMath(Math::xarrow('→', 'f', 'n=0'));
-        self::assertSame('<m:oMath><m:limLow><m:e><m:limUpp><m:e>' . $arrow . $ph . self::mr('n') . self::mr('=') . self::mr('0') . '</m:e></m:phant></m:e></m:groupChr></m:e><m:lim>' . self::mr('f') . '</m:lim></m:limUpp></m:e><m:lim>' . self::mr('n') . self::mr('=') . self::mr('0') . '</m:lim></m:limLow></m:oMath>', $both);
+        self::assertSame('<m:oMath><m:limLow><m:e><m:limUpp><m:e>' . $arrow . $ph . $pad . self::mr('n') . self::mr('=') . self::mr('0') . $pad . '</m:e></m:phant></m:e></m:groupChr></m:e><m:lim>' . self::mr('f') . '</m:lim></m:limUpp></m:e><m:lim>' . self::mr('n') . self::mr('=') . self::mr('0') . '</m:lim></m:limLow></m:oMath>', $both);
         $both = self::oMath(Math::xarrow('→', 'n=0', 'f'));
-        self::assertSame('<m:oMath><m:limLow><m:e><m:limUpp><m:e>' . $arrow . $ph . self::mr('n') . self::mr('=') . self::mr('0') . '</m:e></m:phant></m:e></m:groupChr></m:e><m:lim>' . self::mr('n') . self::mr('=') . self::mr('0') . '</m:lim></m:limUpp></m:e><m:lim>' . self::mr('f') . '</m:lim></m:limLow></m:oMath>', $both);
+        self::assertSame('<m:oMath><m:limLow><m:e><m:limUpp><m:e>' . $arrow . $ph . $pad . self::mr('n') . self::mr('=') . self::mr('0') . $pad . '</m:e></m:phant></m:e></m:groupChr></m:e><m:lim>' . self::mr('n') . self::mr('=') . self::mr('0') . '</m:lim></m:limUpp></m:e><m:lim>' . self::mr('f') . '</m:lim></m:limLow></m:oMath>', $both);
     }
 
     public function test_xlongequal_label_is_a_group_character(): void
@@ -425,5 +443,16 @@ final class OmmlWriterTest extends TestCase
         // "&lt;&lt;" is two characters, shorter than "abc": the arrow groups the under label.
         $xml = OmmlWriter::oMath(Math::xarrow('→', '<<', 'abc'));
         self::assertMatchesRegularExpression('#<m:limUpp><m:e><m:groupChr>.*<m:phant>.*>a<.*>b<.*>c<.*</m:phant>#s', $xml);
+    }
+
+    public function test_blank_limits_are_left_out(): void
+    {
+        foreach (['\\overset{}{x}', '\\underset{}{x}', '\\overbrace{x}^{}', '\\underbrace{x}_{}', '\\overset{}{\\underset{}{x}}'] as $tex) {
+            $xml = OmmlWriter::oMath(Math::tex($tex));
+            self::assertStringNotContainsString('<m:lim>', $xml, $tex);
+            self::assertStringNotContainsString('<m:limUpp>', $xml, $tex);
+            self::assertStringNotContainsString('<m:limLow>', $xml, $tex);
+            self::assertStringContainsString('>x<', $xml, $tex);
+        }
     }
 }
